@@ -1,11 +1,12 @@
 import express from 'express';
-import { spawn, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { initialProgress, isAbortError, planJob, runPlan, summarizePlan } from './lib/copyEngine.js';
 
 const execFileP = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -55,6 +56,18 @@ async function diskUsage(dir) {
     } catch {
         return null;
     }
+}
+
+function fmtBytes(n) {
+    if (n == null || Number.isNaN(n)) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) {
+        v /= 1024;
+        i += 1;
+    }
+    return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 // Size of a directory in bytes, via du. Returns null on error.
@@ -112,8 +125,8 @@ app.get('/api/folders', async (_req, res) => {
 });
 
 // ── Copy jobs ─────────────────────────────────────────────────────────────────
-// A job runs rsync over the selected folders sequentially, buffering output so
-// a client can (re)connect to the SSE stream and catch up.
+// A job walks + streams files, buffering output so a client can (re)connect
+// to the SSE stream and catch up. Progress is a structured percent, not rsync text.
 const jobs = new Map();
 
 function newJob({ drive, folders, del }) {
@@ -123,10 +136,12 @@ function newJob({ drive, folders, del }) {
         drive,
         folders,
         del,
-        status: 'running', // running | done | error
+        status: 'running', // running | done | error | cancelled
         lines: [],
         clients: new Set(),
-        proc: null,
+        abort: new AbortController(),
+        preflight: null,
+        progress: null,
         createdAt: Date.now(),
     };
     jobs.set(id, job);
@@ -135,72 +150,83 @@ function newJob({ drive, folders, del }) {
 
 function emit(job, event, data) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    if (event === 'line') {
-        // Collapse consecutive progress updates in the stored buffer so replay to
-        // a reconnecting client stays small — only the latest progress line matters.
-        const last = job.lines[job.lines.length - 1];
-        if (data.type === 'progress' && last && last.type === 'progress') {
-            job.lines[job.lines.length - 1] = data;
-        } else {
-            job.lines.push(data);
-        }
-    }
+    if (event === 'line') job.lines.push(data);
+    if (event === 'preflight') job.preflight = data;
+    if (event === 'progress') job.progress = data;
     for (const client of job.clients) client.write(payload);
+}
+
+function finishJob(job, status) {
+    if (job.status !== 'running') return;
+    job.status = status;
+    emit(job, 'done', { status });
 }
 
 async function runJob(job) {
     const destBase = path.join(MOUNT_BASE, job.drive);
-    for (const folder of job.folders) {
-        const src = path.join(SOURCE_BASE, folder) + '/.';
-        const dest = path.join(destBase, folder);
+    const signal = job.abort.signal;
 
-        emit(job, 'line', { type: 'header', text: `Copying: ${folder}` });
+    emit(job, 'line', { type: 'header', text: 'Scanning source and destination…' });
 
-        // rsync options. --delete only when requested. When deleting we drop
-        // --ignore-existing/--update so the destination becomes a true mirror.
-        const opts = ['-a', '--info=progress2', '--human-readable'];
-        if (job.del) {
-            opts.push('--delete');
-        } else {
-            opts.push('--update', '--ignore-existing');
-        }
-
-        const code = await new Promise((resolve) => {
-            const proc = spawn('rsync', [...opts, src, dest]);
-            job.proc = proc;
-            const onData = (buf) => {
-                // rsync's --info=progress2 rewrites the current line with \r; split on
-                // both so each update is its own token. Progress tokens (with a %) are
-                // tagged so the UI can update them in place instead of flooding the log.
-                for (const raw of buf.toString().split(/[\r\n]+/)) {
-                    const text = raw.trim();
-                    if (!text) continue;
-                    const type = /\d+%/.test(text) ? 'progress' : 'out';
-                    emit(job, 'line', { type, text });
-                }
-            };
-            proc.stdout.on('data', onData);
-            proc.stderr.on('data', (buf) =>
-                emit(job, 'line', { type: 'err', text: buf.toString().trimEnd() })
-            );
-            proc.on('error', (err) => {
-                emit(job, 'line', { type: 'err', text: `Failed to start rsync: ${err.message}` });
-                resolve(1);
+    const plan = await planJob({
+        sourceBase: SOURCE_BASE,
+        destBase,
+        folders: job.folders,
+        del: job.del,
+        signal,
+        onSpecial: ({ folder, rel, kind, side }) => {
+            emit(job, 'line', {
+                type: 'err',
+                text: `Skipping ${kind} (${side}): ${folder}/${rel}`,
             });
-            proc.on('close', (c) => resolve(c ?? 1));
-        });
+        },
+    });
 
-        job.proc = null;
-        if (code !== 0) {
-            job.status = 'error';
-            emit(job, 'line', { type: 'err', text: `rsync exited with code ${code}` });
-            emit(job, 'done', { status: 'error' });
-            return;
-        }
+    const usage = await diskUsage(destBase);
+    const summary = summarizePlan(plan);
+    summary.avail = usage?.avail ?? null;
+    summary.fits = usage?.avail == null ? null : plan.bytesToCopy <= usage.avail;
+
+    emit(job, 'preflight', summary);
+    emit(job, 'line', {
+        type: 'header',
+        text:
+            `Plan: copy ${plan.filesToCopy} file${plan.filesToCopy === 1 ? '' : 's'} ` +
+            `(${fmtBytes(plan.bytesToCopy)}), skip ${plan.filesToSkip}` +
+            (job.del ? `, delete ${plan.filesToDelete}` : ''),
+    });
+    if (summary.fits === false) {
+        emit(job, 'line', {
+            type: 'err',
+            text: `Need ${plan.bytesToCopy} bytes but only ${usage.avail} free on the destination.`,
+        });
     }
-    job.status = 'done';
+
+    emit(job, 'progress', initialProgress(plan));
+
+    await runPlan(plan, {
+        signal,
+        onProgress: (p) => emit(job, 'progress', p),
+        onFile: ({ action, folder, file, message }) => {
+            if (action === 'copy') {
+                emit(job, 'line', { type: 'out', text: `copied ${folder}/${file}` });
+            } else if (action === 'delete') {
+                emit(job, 'line', { type: 'out', text: `deleted ${folder}/${file}` });
+            } else if (action === 'skip') {
+                emit(job, 'line', { type: 'out', text: `${folder}: ${message}` });
+            } else if (action === 'error') {
+                emit(job, 'line', {
+                    type: 'err',
+                    text: `${folder}/${file}: ${message}`,
+                });
+            } else {
+                emit(job, 'line', { type: 'out', text: message || `${action} ${folder}/${file}` });
+            }
+        },
+    });
+
     emit(job, 'line', { type: 'header', text: 'Done.' });
-    emit(job, 'done', { status: 'done' });
+    finishJob(job, 'done');
 }
 
 // ── API: start a copy job ─────────────────────────────────────────────────────
@@ -238,10 +264,25 @@ app.post('/api/copy', async (req, res) => {
     res.json({ jobId: job.id });
     // Kick off after responding; clients attach to the SSE stream next.
     runJob(job).catch((err) => {
-        job.status = 'error';
+        if (isAbortError(err) || job.abort.signal.aborted) {
+            emit(job, 'line', { type: 'header', text: 'Cancelled.' });
+            finishJob(job, 'cancelled');
+            return;
+        }
         emit(job, 'line', { type: 'err', text: `Job crashed: ${err.message}` });
-        emit(job, 'done', { status: 'error' });
+        finishJob(job, 'error');
     });
+});
+
+// ── API: cancel a running job ─────────────────────────────────────────────────
+app.post('/api/copy/:id/cancel', (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.status !== 'running') {
+        return res.json({ jobId: job.id, status: job.status });
+    }
+    job.abort.abort();
+    res.json({ jobId: job.id, status: 'cancelling' });
 });
 
 // ── API: SSE stream of a job's output ─────────────────────────────────────────
@@ -257,6 +298,12 @@ app.get('/api/copy/:id/stream', (req, res) => {
     res.flushHeaders();
 
     // Replay what already happened so a late/reconnecting client catches up.
+    if (job.preflight) {
+        res.write(`event: preflight\ndata: ${JSON.stringify(job.preflight)}\n\n`);
+    }
+    if (job.progress) {
+        res.write(`event: progress\ndata: ${JSON.stringify(job.progress)}\n\n`);
+    }
     for (const line of job.lines) {
         res.write(`event: line\ndata: ${JSON.stringify(line)}\n\n`);
     }

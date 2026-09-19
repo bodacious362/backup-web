@@ -213,9 +213,23 @@ ul.folders label.sel {
     color: #fff;
 }
 
-.go.danger-btn {
+.go.danger-btn,
+.stop-btn {
     background: var(--danger);
     border-color: var(--danger);
+    color: #fff;
+}
+
+.stop-btn.compact {
+    width: auto;
+    margin: 0;
+    padding: 5px 12px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.stop-btn:disabled {
+    opacity: 0.7;
 }
 
 .banner {
@@ -254,8 +268,116 @@ ul.folders label.sel {
     color: var(--ok);
 }
 
-.status.error {
+.status.error,
+.status.cancelled {
     color: var(--danger);
+}
+
+.danger-text {
+    color: var(--danger);
+}
+
+.xfer {
+    margin: 4px 0 12px;
+}
+
+.xfer-total {
+    margin-bottom: 14px;
+}
+
+.xfer-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+}
+
+.xfer-name {
+    font-weight: 600;
+}
+
+.xfer-pct {
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.xfer-bar {
+    height: 10px;
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.xfer-bar.lg {
+    height: 12px;
+}
+
+.xfer-bar.sm {
+    height: 7px;
+}
+
+.xfer-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: inherit;
+    transition: width 0.12s linear;
+}
+
+.xfer-folder.done .xfer-fill {
+    background: var(--ok);
+}
+
+.xfer-folder.active .xfer-name {
+    color: var(--accent);
+}
+
+.xfer-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    margin-top: 6px;
+    font-size: 13px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.xfer-meta strong {
+    color: var(--text);
+}
+
+.xfer-folders {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.xfer-folder {
+    padding: 10px 12px;
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.xfer-folder.active {
+    border-color: var(--accent);
+}
+
+.xfer-file,
+.xfer-file-inline {
+    margin: 6px 0 0;
+    font-size: 13px;
+    word-break: break-all;
+}
+
+.xfer-file-inline {
+    margin: 0;
+    flex: 1 1 100%;
 }
 
 .log {

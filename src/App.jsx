@@ -1,5 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { bytes } from './format.js'
+import { bytes, duration, percent } from './format.js'
+
+function Bar({ value, size = 'md' }) {
+    const w = Math.min(100, Math.max(0, value ?? 0))
+    return (
+        <div
+            className={`xfer-bar ${size}`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={w}
+            role="progressbar"
+        >
+            <div className="xfer-fill" style={{ width: `${w}%` }} />
+        </div>
+    )
+}
 
 const api = (p, opts) => fetch(p, opts).then(async (r) => {
     const data = await r.json().catch(() => ({}))
@@ -22,6 +37,9 @@ export default function App() {
     const [confirming, setConfirming] = useState(false)
     const [job, setJob] = useState(null) // { id, status }
     const [log, setLog] = useState([])
+    const [progress, setProgress] = useState(null)
+    const [preflight, setPreflight] = useState(null)
+    const [stopping, setStopping] = useState(false)
     const logRef = useRef(null)
     const esRef = useRef(null)
 
@@ -73,6 +91,31 @@ export default function App() {
         [folders, selected]
     )
 
+    const folderBars = useMemo(() => {
+        if (progress?.folders?.length) return progress.folders
+        if (preflight?.folders?.length) {
+            return preflight.folders.map((f) => ({
+                ...f,
+                bytesCopied: 0,
+                filesDone: 0,
+                percent: 0,
+                status: 'pending',
+            }))
+        }
+        if (job) {
+            return [...selected].sort().map((name) => ({
+                name,
+                bytesCopied: 0,
+                bytesToCopy: null,
+                filesDone: 0,
+                filesToCopy: null,
+                percent: 0,
+                status: 'pending',
+            }))
+        }
+        return []
+    }, [progress, preflight, job, selected])
+
     const drive = drives.find((d) => d.name === selectedDrive)
     const fitsWarning =
         drive && drive.usage && totalSelectedSize > drive.usage.avail
@@ -96,6 +139,9 @@ export default function App() {
         setConfirming(false)
         setError('')
         setLog([])
+        setProgress(null)
+        setPreflight(null)
+        setStopping(false)
         try {
             const { jobId } = await api('/api/copy', {
                 method: 'POST',
@@ -110,16 +156,15 @@ export default function App() {
 
             const es = new EventSource(`/api/copy/${jobId}/stream`)
             esRef.current = es
+            es.addEventListener('preflight', (ev) => {
+                setPreflight(JSON.parse(ev.data))
+            })
+            es.addEventListener('progress', (ev) => {
+                setProgress(JSON.parse(ev.data))
+            })
             es.addEventListener('line', (ev) => {
                 const line = JSON.parse(ev.data)
-                setLog((l) => {
-                    const last = l[l.length - 1]
-                    // Replace the previous progress line in place instead of stacking.
-                    if (line.type === 'progress' && last && last.type === 'progress') {
-                        return [...l.slice(0, -1), line]
-                    }
-                    return [...l, line]
-                })
+                setLog((l) => [...l, line])
             })
             es.addEventListener('done', (ev) => {
                 const { status } = JSON.parse(ev.data)
@@ -131,6 +176,17 @@ export default function App() {
                 // stream dropped; leave whatever we have
             }
         } catch (e) {
+            setError(e.message)
+        }
+    }
+
+    async function stopCopy() {
+        if (!job?.id || !running || stopping) return
+        setStopping(true)
+        try {
+            await api(`/api/copy/${job.id}/cancel`, { method: 'POST' })
+        } catch (e) {
+            setStopping(false)
             setError(e.message)
         }
     }
@@ -247,8 +303,8 @@ export default function App() {
                         <strong>Delete extraneous files on the destination</strong>
                         <small>
                             Makes each copied folder a mirror of the source: files on the drive
-                            that aren't in the source are removed. Off = only add/update, never
-                            delete.
+                            that aren't in the source are removed. Off = copy missing or
+                            different-size files, never delete extras.
                         </small>
                     </span>
                 </label>
@@ -270,7 +326,7 @@ export default function App() {
                 <div className="sumrow">
                     <span>Mode</span>
                     <strong className={del ? 'danger' : ''}>
-                        {del ? 'Mirror (delete extras)' : 'Add / update only'}
+                        {del ? 'Mirror (delete extras)' : 'Copy if missing or size differs'}
                     </strong>
                 </div>
                 {fitsWarning && (
@@ -280,9 +336,15 @@ export default function App() {
                         the drive won't be recopied — but it may not fit.
                     </div>
                 )}
-                <button className="go" disabled={!canCopy} onClick={() => setConfirming(true)}>
-                    {running ? 'Copying…' : 'Copy'}
-                </button>
+                {running ? (
+                    <button className="go stop-btn" disabled={stopping} onClick={stopCopy}>
+                        {stopping ? 'Stopping…' : 'Stop'}
+                    </button>
+                ) : (
+                    <button className="go" disabled={!canCopy} onClick={() => setConfirming(true)}>
+                        Copy
+                    </button>
+                )}
             </section>
 
             {/* ── Live log ───────────────────────────────────────────── */}
@@ -290,16 +352,92 @@ export default function App() {
                 <section className="card">
                     <div className="card-head">
                         <h2>Progress</h2>
-                        {job && (
-                            <span className={`status ${job.status}`}>
-                                {job.status === 'running'
-                                    ? 'running'
-                                    : job.status === 'done'
-                                        ? 'done ✓'
-                                        : 'error ✗'}
-                            </span>
+                        <div className="head-actions">
+                            {running && (
+                                <button className="stop-btn compact" disabled={stopping} onClick={stopCopy}>
+                                    {stopping ? 'Stopping…' : 'Stop'}
+                                </button>
+                            )}
+                            {job && (
+                                <span className={`status ${stopping && running ? 'cancelled' : job.status}`}>
+                                    {stopping && running
+                                        ? 'stopping'
+                                        : job.status === 'running'
+                                            ? 'running'
+                                            : job.status === 'done'
+                                                ? 'done ✓'
+                                                : job.status === 'cancelled'
+                                                    ? 'cancelled'
+                                                    : 'error ✗'}
+                                </span>
+                            )}
+                        </div>
+                    </div>
+                    <div className="xfer">
+                        <div className="xfer-total">
+                            <div className="xfer-row">
+                                <span className="xfer-name">Total</span>
+                                <strong>{percent(progress?.percent ?? 0)}</strong>
+                            </div>
+                            <Bar value={progress?.percent ?? 0} size="lg" />
+                            <div className="xfer-meta">
+                                <span>
+                                    {bytes(progress?.bytesCopied ?? 0)} / {bytes(progress?.bytesToCopy)}
+                                </span>
+                                <span>
+                                    {progress
+                                        ? `${progress.filesDone}/${progress.filesToCopy} files`
+                                        : 'Scanning…'}
+                                </span>
+                                <span>
+                                    {progress?.speedBps > 0 ? `${bytes(progress.speedBps)}/s` : '—'}
+                                </span>
+                                <span>ETA {duration(progress?.etaSec)}</span>
+                            </div>
+                        </div>
+                        {folderBars.length > 0 && (
+                            <ul className="xfer-folders">
+                                {folderBars.map((f) => {
+                                    const active = progress?.folder === f.name
+                                    return (
+                                        <li key={f.name} className={`xfer-folder ${f.status || ''} ${active ? 'active' : ''}`}>
+                                            <div className="xfer-row">
+                                                <span className="xfer-name">{f.name}</span>
+                                                <span className="xfer-pct">{percent(f.percent ?? 0)}</span>
+                                            </div>
+                                            <Bar value={f.percent ?? 0} size="sm" />
+                                            <div className="xfer-meta">
+                                                <span>
+                                                    {bytes(f.bytesCopied ?? 0)} / {bytes(f.bytesToCopy)}
+                                                </span>
+                                                <span>
+                                                    {f.filesDone ?? 0}/{f.filesToCopy ?? 0} files
+                                                </span>
+                                                {active && progress?.file ? (
+                                                    <span className="xfer-file-inline">{progress.file}</span>
+                                                ) : f.status === 'done' ? (
+                                                    <span>done</span>
+                                                ) : f.status === 'running' ? (
+                                                    <span>copying</span>
+                                                ) : (
+                                                    <span>waiting</span>
+                                                )}
+                                            </div>
+                                        </li>
+                                    )
+                                })}
+                            </ul>
+                        )}
+                        {job?.status === 'running' && !progress && (
+                            <p className="xfer-file muted">Comparing path and size…</p>
                         )}
                     </div>
+                    {preflight?.fits === false && (
+                        <div className="banner warn">
+                            Preflight needs {bytes(preflight.bytesToCopy)} but the drive has{' '}
+                            {bytes(preflight.avail)} free.
+                        </div>
+                    )}
                     <pre className="log" ref={logRef}>
                         {log.map((l, i) => (
                             <div key={i} className={`ln ${l.type}`}>
@@ -308,7 +446,7 @@ export default function App() {
                         ))}
                     </pre>
                     {job && job.status !== 'running' && (
-                        <button className="ghost" onClick={() => { setJob(null); setLog([]) }}>
+                        <button className="ghost" onClick={() => { setJob(null); setLog([]); setProgress(null); setPreflight(null); setStopping(false) }}>
                             Clear
                         </button>
                     )}
@@ -332,7 +470,8 @@ export default function App() {
                             </p>
                         ) : (
                             <p className="muted">
-                                Add/update only — nothing on the drive will be deleted. The source
+                                Files with the same path and size are skipped; anything else is
+                                copied or overwritten. Nothing on the drive is deleted. The source
                                 is never modified.
                             </p>
                         )}
@@ -354,7 +493,7 @@ export default function App() {
             )}
 
             <footer>
-                Source is only ever read — rsync never modifies <code>{config?.sourceBase || '/mnt/MEDIA'}</code>.
+                Source is only ever read — the copy never modifies <code>{config?.sourceBase || '/mnt/MEDIA'}</code>.
             </footer>
         </div>
     )
