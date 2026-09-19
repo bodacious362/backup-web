@@ -1,0 +1,22 @@
+{
+    "name": "usb-copy-gui",
+    "version": "1.0.0",
+    "description": "Web GUI to copy folders from a source directory onto mounted USB drives via rsync",
+    "type": "module",
+    "scripts": {
+        "dev": "concurrently -k -n server,client -c blue,magenta \"node server.js\" \"vite\"",
+        "build": "vite build",
+        "start": "node server.js",
+        "serve": "npm run build && npm start"
+    },
+    "dependencies": {
+        "express": "^4.19.2"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-react": "^4.3.1",
+        "concurrently": "^8.2.2",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "vite": "^5.4.2"
+    }
+}
