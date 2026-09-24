@@ -61,7 +61,11 @@ async function isMountpoint(dir) {
 // Disk usage for a mountpoint, via df. Returns null if unavailable.
 async function diskUsage(dir) {
     try {
-        const { stdout } = await execFileP('df', ['-B1', '--output=size,used,avail', dir]);
+        const { stdout } = await execFileP(
+            'df',
+            ['-B1', '--output=size,used,avail', dir],
+            { timeout: 5000, killSignal: 'SIGKILL' }
+        );
         const line = stdout.trim().split('\n')[1] || '';
         const [size, used, avail] = line.trim().split(/\s+/).map((n) => parseInt(n, 10));
         if ([size, used, avail].some(Number.isNaN)) return null;
@@ -83,15 +87,30 @@ function fmtBytes(n) {
     return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-// Size of a directory in bytes, via du. Returns null on error.
+// Size of a directory in bytes, via du. Returns null on error/timeout.
+// Avoid calling this while listing folders — du walks the whole tree and can
+// hang for a long time on large or stale USB mounts.
 async function dirSize(dir) {
     try {
-        const { stdout } = await execFileP('du', ['-sb', dir]);
+        const { stdout } = await execFileP('du', ['-sb', dir], {
+            timeout: 8000,
+            killSignal: 'SIGKILL',
+        });
         const bytes = parseInt(stdout.trim().split(/\s+/)[0], 10);
         return Number.isNaN(bytes) ? null : bytes;
     } catch {
         return null;
     }
+}
+
+function withTimeout(promise, ms, message) {
+    let timer;
+    return Promise.race([
+        Promise.resolve(promise).finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(message)), ms);
+        }),
+    ]);
 }
 
 function isSafeDeviceName(name) {
@@ -230,7 +249,7 @@ app.get('/api/drives', async (_req, res) => {
 
 // ── API: list folders in the copy source ─────────────────────────────────────
 // direction=to-usb (default): folders under SOURCE_BASE
-// direction=from-usb: folders under the selected USB drive
+// direction=from-usb: folders under the selected USB drive (?drive= required)
 app.get('/api/folders', async (req, res) => {
     const direction = normalizeDirection(req.query.direction);
     const drive = typeof req.query.drive === 'string' ? req.query.drive : '';
@@ -248,22 +267,37 @@ app.get('/api/folders', async (req, res) => {
     }
 
     try {
-        const stat = await fsp.stat(sourceBase).catch(() => null);
+        const stat = await withTimeout(
+            fsp.stat(sourceBase).catch(() => null),
+            5000,
+            `Timed out stating ${sourceBase}`
+        );
         if (!stat || !stat.isDirectory()) {
             return res.status(404).json({ error: `Source ${sourceBase} not found` });
         }
-        const entries = await fsp.readdir(sourceBase, { withFileTypes: true });
-        const folders = [];
-        for (const e of entries) {
-            if (!e.isDirectory()) continue;
-            const size = await dirSize(path.join(sourceBase, e.name));
-            folders.push({ name: e.name, size });
+        const entries = await withTimeout(
+            fsp.readdir(sourceBase, { withFileTypes: true }),
+            8000,
+            `Timed out reading ${sourceBase}`
+        );
+        const dirs = entries.filter((e) => e.isDirectory());
+        // Skip `du` for USB→MEDIA: walking large/stale USB trees hung this endpoint.
+        // MEDIA→USB still gets sizes (each `du` has its own timeout).
+        let folders;
+        if (direction === 'from-usb') {
+            folders = dirs.map((e) => ({ name: e.name, size: null }));
+        } else {
+            folders = await Promise.all(
+                dirs.map(async (e) => ({
+                    name: e.name,
+                    size: await dirSize(path.join(sourceBase, e.name)),
+                }))
+            );
         }
         folders.sort((a, b) => a.name.localeCompare(b.name));
+
         const destUsage =
-            direction === 'from-usb'
-                ? await diskUsage(SOURCE_BASE)
-                : null;
+            direction === 'from-usb' ? await diskUsage(SOURCE_BASE) : null;
         res.json({
             sourceBase,
             direction,
@@ -272,7 +306,8 @@ app.get('/api/folders', async (req, res) => {
             destUsage,
         });
     } catch (err) {
-        res.status(500).json({ error: `Cannot read ${sourceBase}: ${err.message}` });
+        const status = /timed out/i.test(err.message) ? 504 : 500;
+        res.status(status).json({ error: `Cannot read ${sourceBase}: ${err.message}` });
     }
 });
 
