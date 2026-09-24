@@ -26,3 +26,16 @@ export function percent(n) {
     const v = Math.min(100, Math.max(0, n))
     return `${v.toFixed(v >= 10 || v === 0 ? 0 : 1)}%`
 }
+
+export function when(iso) {
+    if (!iso) return '—'
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return String(iso)
+    return d.toLocaleString(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+    })
+}

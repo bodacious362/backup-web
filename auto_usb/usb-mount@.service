@@ -1,0 +1,10 @@
+[Unit]
+Description=Auto-mount USB drive %i
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/usb-mount.sh add %i
+ExecStop=/usr/local/bin/usb-mount.sh remove %i

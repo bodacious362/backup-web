@@ -1,0 +1,6 @@
+[Unit]
+Description=Unmount USB drive %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/usb-mount.sh unmount %i
