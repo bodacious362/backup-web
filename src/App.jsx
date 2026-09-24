@@ -75,6 +75,7 @@ export default function App() {
     const [loadingFolders, setLoadingFolders] = useState(true)
     const [error, setError] = useState('')
 
+    const [direction, setDirection] = useState('to-usb') // to-usb | from-usb
     const [selectedDrive, setSelectedDrive] = useState('')
     const [busyDrive, setBusyDrive] = useState('')
     const [selected, setSelected] = useState(() => new Set())
@@ -82,6 +83,7 @@ export default function App() {
     const [history, setHistory] = useState([])
     const [loadingHistory, setLoadingHistory] = useState(false)
     const [historyError, setHistoryError] = useState('')
+    const [mediaUsage, setMediaUsage] = useState(null)
 
     const [confirming, setConfirming] = useState(false)
     const [job, setJob] = useState(null) // { id, status }
@@ -94,6 +96,8 @@ export default function App() {
     const esRef = useRef(null)
 
     const running = job && job.status === 'running'
+    const toUsb = direction === 'to-usb'
+    const mediaLabel = config?.sourceBase || '/mnt/MEDIA'
 
     // ── Load drives + folders ──────────────────────────────────────────────
     async function loadDrives({ silent } = {}) {
@@ -140,23 +144,46 @@ export default function App() {
         }
     }
 
-    async function loadFolders() {
+    async function loadFolders({ drive = selectedDrive, dir = direction } = {}) {
+        if (dir === 'from-usb' && !drive) {
+            setFolders([])
+            setMediaUsage(null)
+            setSelected(new Set())
+            setLoadingFolders(false)
+            return
+        }
         setLoadingFolders(true)
         try {
-            const f = await api('/api/folders')
+            const qs = new URLSearchParams({ direction: dir })
+            if (dir === 'from-usb') qs.set('drive', drive)
+            const f = await api(`/api/folders?${qs}`)
             setFolders(f.folders)
+            setMediaUsage(f.destUsage || null)
+            setSelected((cur) => {
+                const names = new Set(f.folders.map((x) => x.name))
+                return new Set([...cur].filter((n) => names.has(n)))
+            })
         } catch (e) {
+            setFolders([])
+            setMediaUsage(null)
             setError(e.message)
         } finally {
             setLoadingFolders(false)
         }
     }
 
+    function changeDirection(next) {
+        if (running || next === direction) return
+        setDirection(next)
+        setSelected(new Set())
+        setConfirming(false)
+    }
+
     useEffect(() => {
         let cancelled = false
         api('/api/config').then(setConfig).catch(() => { })
         ;(async () => {
-            await Promise.all([loadDrives(), loadFolders()])
+            await loadDrives()
             if (!cancelled) await resumeActiveJob()
         })()
         return () => {
@@ -168,6 +195,10 @@ export default function App() {
     useEffect(() => {
         if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
     }, [log])
+
+    useEffect(() => {
+        loadFolders({ drive: selectedDrive, dir: direction })
+    }, [direction, selectedDrive])
 
     async function loadHistory(drive = selectedDrive) {
         if (!drive) {
@@ -235,8 +266,10 @@ export default function App() {
     }, [progress, scan, preflight, job, selected])
 
     const drive = drives.find((d) => d.name === selectedDrive)
-    const fitsWarning =
-        drive && drive.usage && totalSelectedSize > drive.usage.avail
+    const destUsage = toUsb ? drive?.usage : mediaUsage
+    const destLabel = toUsb ? selectedDrive || '—' : mediaLabel
+    const sourceLabel = toUsb ? mediaLabel : selectedDrive || '—'
+    const fitsWarning = destUsage && totalSelectedSize > destUsage.avail
 
     function toggle(name) {
         setSelected((s) => {
@@ -252,7 +285,7 @@ export default function App() {
         )
     }
 
-    function attachStream(jobId, drive) {
+    function attachStream(jobId, driveName) {
         if (esRef.current) {
             esRef.current.close()
             esRef.current = null
@@ -276,8 +309,9 @@ export default function App() {
             const { status } = JSON.parse(ev.data)
             setJob((j) => (j ? { ...j, status } : j))
             es.close()
-            loadDrives() // refresh free space
-            loadHistory(drive)
+            loadDrives()
+            loadFolders()
+            loadHistory(driveName)
         })
         es.onerror = () => {
             // stream dropped; leave whatever we have
@@ -288,7 +322,11 @@ export default function App() {
         try {
             const data = await api('/api/copy')
             const active = (data.jobs || [])[0]
-            if (!active) return
+            if (!active) {
+                await loadFolders()
+                return
+            }
+            setDirection(active.direction === 'from-usb' ? 'from-usb' : 'to-usb')
             setSelectedDrive(active.drive)
             setSelected(new Set(active.folders))
             setDel(!!active.del)
@@ -300,7 +338,7 @@ export default function App() {
             setJob({ id: active.id, status: active.status })
             attachStream(active.id, active.drive)
         } catch {
-            // no running job, or the list endpoint isn't available yet
+            await loadFolders()
         }
     }
 
@@ -321,6 +359,7 @@ export default function App() {
                     drive: selectedDrive,
                     folders: [...selected],
                     del,
+                    direction,
                 }),
             })
             setJob({ id: jobId, status: 'running' })
@@ -349,8 +388,17 @@ export default function App() {
                 <h1>USB Copy</h1>
                 {config && (
                     <p className="sub">
-                        Source <code>{config.sourceBase}</code> → drives under{' '}
-                        <code>{config.mountBase}</code>
+                        {toUsb ? (
+                            <>
+                                <code>{config.sourceBase}</code> → USB drives under{' '}
+                                <code>{config.mountBase}</code>
+                            </>
+                        ) : (
+                            <>
+                                USB drives under <code>{config.mountBase}</code> →{' '}
+                                <code>{config.sourceBase}</code>
+                            </>
+                        )}
                     </p>
                 )}
             </header>
@@ -374,10 +422,43 @@ export default function App() {
             )}
             <div className="main">
 
+            {/* ── Direction ──────────────────────────────────────────── */}
+            <section className="card">
+                <h2>1 · Direction</h2>
+                <div className="direction-opts" role="radiogroup" aria-label="Copy direction">
+                    <label className={`direction-opt ${toUsb ? 'sel' : ''}`}>
+                        <input
+                            type="radio"
+                            name="direction"
+                            checked={toUsb}
+                            onChange={() => changeDirection('to-usb')}
+                            disabled={running}
+                        />
+                        <span>
+                            <strong>{mediaLabel} → USB drive</strong>
+                            <small>Back up folders from media storage onto a USB drive.</small>
+                        </span>
+                    </label>
+                    <label className={`direction-opt ${!toUsb ? 'sel' : ''}`}>
+                        <input
+                            type="radio"
+                            name="direction"
+                            checked={!toUsb}
+                            onChange={() => changeDirection('from-usb')}
+                            disabled={running}
+                        />
+                        <span>
+                            <strong>USB drive → {mediaLabel}</strong>
+                            <small>Restore folders from a USB drive onto media storage.</small>
+                        </span>
+                    </label>
+                </div>
+            </section>
+
             {/* ── Drives ─────────────────────────────────────────────── */}
             <section className="card">
                 <div className="card-head">
-                    <h2>1 · Destination drive</h2>
+                    <h2>2 · USB drive {toUsb ? '(destination)' : '(source)'}</h2>
                     <button className="ghost" onClick={loadDrives} disabled={running}>
                         ↻ Refresh
                     </button>
@@ -453,19 +534,25 @@ export default function App() {
             {/* ── Folders ────────────────────────────────────────────── */}
             <section className="card">
                 <div className="card-head">
-                    <h2>2 · Folders to copy</h2>
+                    <h2>3 · Folders to copy</h2>
                     <div className="head-actions">
                         {folders.length > 0 && (
                             <button className="ghost" onClick={toggleAll} disabled={running}>
                                 {selected.size === folders.length ? 'Clear all' : 'Select all'}
                             </button>
                         )}
-                        <button className="ghost" onClick={loadFolders} disabled={running}>
+                        <button
+                            className="ghost"
+                            onClick={() => loadFolders()}
+                            disabled={running || (!toUsb && !selectedDrive)}
+                        >
                             ↻ Refresh
                         </button>
                     </div>
                 </div>
-                {loadingFolders ? (
+                {!toUsb && !selectedDrive ? (
+                    <p className="muted">Select a USB drive to list its folders.</p>
+                ) : loadingFolders ? (
                     <p className="muted">Reading source…</p>
                 ) : folders.length === 0 ? (
                     <p className="muted">No folders in source.</p>
@@ -491,7 +578,7 @@ export default function App() {
 
             {/* ── Options ────────────────────────────────────────────── */}
             <section className="card">
-                <h2>3 · Options</h2>
+                <h2>4 · Options</h2>
                 <label className={`delete-opt ${del ? 'on' : ''}`}>
                     <input
                         type="checkbox"
@@ -502,9 +589,10 @@ export default function App() {
                     <span>
                         <strong>Delete extraneous files on the destination</strong>
                         <small>
-                            Makes each copied folder a mirror of the source: files on the drive
-                            that aren't in the source are removed. Off = copy missing or
-                            different-size files, never delete extras.
+                            Makes each copied folder a mirror of the source: files on{' '}
+                            {toUsb ? 'the USB drive' : mediaLabel} that aren't in the source are
+                            removed. Off = copy missing or different-size files, never delete
+                            extras.
                         </small>
                     </span>
                 </label>
@@ -513,15 +601,25 @@ export default function App() {
             {/* ── Summary + action ───────────────────────────────────── */}
             <section className="card summary">
                 <div className="sumrow">
+                    <span>Direction</span>
+                    <strong>
+                        {toUsb ? `${mediaLabel} → USB` : `USB → ${mediaLabel}`}
+                    </strong>
+                </div>
+                <div className="sumrow">
+                    <span>Source</span>
+                    <strong>{sourceLabel}</strong>
+                </div>
+                <div className="sumrow">
+                    <span>Destination</span>
+                    <strong>{destLabel}</strong>
+                </div>
+                <div className="sumrow">
                     <span>Selected</span>
                     <strong>
                         {selected.size} folder{selected.size === 1 ? '' : 's'} ·{' '}
                         {bytes(totalSelectedSize)}
                     </strong>
-                </div>
-                <div className="sumrow">
-                    <span>Destination</span>
-                    <strong>{selectedDrive || '—'}</strong>
                 </div>
                 <div className="sumrow">
                     <span>Mode</span>
@@ -532,8 +630,8 @@ export default function App() {
                 {fitsWarning && (
                     <div className="banner warn">
                         Selection ({bytes(totalSelectedSize)}) is larger than free space (
-                        {bytes(drive.usage.avail)}). This is an upper bound — files already on
-                        the drive won't be recopied — but it may not fit.
+                        {bytes(destUsage.avail)}). This is an upper bound — files already on
+                        the destination won't be recopied — but it may not fit.
                     </div>
                 )}
                 {running ? (
@@ -691,7 +789,7 @@ export default function App() {
                     </div>
                     {preflight?.fits === false && (
                         <div className="banner warn">
-                            Preflight needs {bytes(preflight.bytesToCopy)} but the drive has{' '}
+                            Preflight needs {bytes(preflight.bytesToCopy)} but the destination has{' '}
                             {bytes(preflight.avail)} free.
                         </div>
                     )}
@@ -717,19 +815,18 @@ export default function App() {
                         <h3>Confirm copy</h3>
                         <p>
                             Copy <strong>{selected.size}</strong> folder
-                            {selected.size === 1 ? '' : 's'} ({bytes(totalSelectedSize)}) to{' '}
-                            <strong>{selectedDrive}</strong>.
+                            {selected.size === 1 ? '' : 's'} ({bytes(totalSelectedSize)}) from{' '}
+                            <strong>{sourceLabel}</strong> to <strong>{destLabel}</strong>.
                         </p>
                         {del ? (
                             <p className="danger">
-                                ⚠ Mirror mode: files on the drive that aren't in the source
+                                ⚠ Mirror mode: files on the destination that aren't in the source
                                 (inside the copied folders) will be <strong>deleted</strong>.
                             </p>
                         ) : (
                             <p className="muted">
                                 Files with the same path and size are skipped; anything else is
-                                copied or overwritten. Nothing on the drive is deleted. The source
-                                is never modified.
+                                copied or overwritten. Nothing on the destination is deleted.
                             </p>
                         )}
                         <ul className="confirm-list">
@@ -753,7 +850,9 @@ export default function App() {
             </div>
 
             <footer>
-                Source is only ever read — the copy never modifies <code>{config?.sourceBase || '/mnt/MEDIA'}</code>.
+                {toUsb
+                    ? <>Source is only ever read — the copy never modifies <code>{mediaLabel}</code>.</>
+                    : <>USB is only ever read — the copy writes to <code>{mediaLabel}</code>.</>}
             </footer>
         </div>
     )

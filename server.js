@@ -23,6 +23,12 @@ const SOURCE_BASE = process.env.SOURCE_BASE || '/mnt/MEDIA';
 const MOUNT_BASE = process.env.MOUNT_BASE || '/mnt/usb';
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const HOST = process.env.HOST || '0.0.0.0';
+const BACKUP_LOG = 'backup.log';
+const DIRECTIONS = new Set(['to-usb', 'from-usb']);
+
+function normalizeDirection(value) {
+    return DIRECTIONS.has(value) ? value : 'to-usb';
+}
 
 const app = express();
 app.use(express.json());
@@ -222,24 +228,51 @@ app.get('/api/drives', async (_req, res) => {
     }
 });
 
-// ── API: list folders in the source ──────────────────────────────────────────
-app.get('/api/folders', async (_req, res) => {
-    try {
-        const stat = await fsp.stat(SOURCE_BASE).catch(() => null);
-        if (!stat || !stat.isDirectory()) {
-            return res.status(404).json({ error: `Source ${SOURCE_BASE} not found` });
+// ── API: list folders in the copy source ─────────────────────────────────────
+// direction=to-usb (default): folders under SOURCE_BASE
+// direction=from-usb: folders under the selected USB drive
+app.get('/api/folders', async (req, res) => {
+    const direction = normalizeDirection(req.query.direction);
+    const drive = typeof req.query.drive === 'string' ? req.query.drive : '';
+
+    let sourceBase = SOURCE_BASE;
+    if (direction === 'from-usb') {
+        if (!isSafeSegment(drive)) {
+            return res.status(400).json({ error: 'Select a USB drive first' });
         }
-        const entries = await fsp.readdir(SOURCE_BASE, { withFileTypes: true });
+        const usb = await resolveUsbDrive(drive);
+        if (usb.error) {
+            return res.status(usb.status).json({ error: usb.error });
+        }
+        sourceBase = usb.usbBase;
+    }
+
+    try {
+        const stat = await fsp.stat(sourceBase).catch(() => null);
+        if (!stat || !stat.isDirectory()) {
+            return res.status(404).json({ error: `Source ${sourceBase} not found` });
+        }
+        const entries = await fsp.readdir(sourceBase, { withFileTypes: true });
         const folders = [];
         for (const e of entries) {
             if (!e.isDirectory()) continue;
-            const size = await dirSize(path.join(SOURCE_BASE, e.name));
+            const size = await dirSize(path.join(sourceBase, e.name));
             folders.push({ name: e.name, size });
         }
         folders.sort((a, b) => a.name.localeCompare(b.name));
-        res.json({ sourceBase: SOURCE_BASE, folders });
+        const destUsage =
+            direction === 'from-usb'
+                ? await diskUsage(SOURCE_BASE)
+                : null;
+        res.json({
+            sourceBase,
+            direction,
+            folders,
+            destBase: direction === 'from-usb' ? SOURCE_BASE : null,
+            destUsage,
+        });
     } catch (err) {
-        res.status(500).json({ error: `Cannot read ${SOURCE_BASE}: ${err.message}` });
+        res.status(500).json({ error: `Cannot read ${sourceBase}: ${err.message}` });
     }
 });
 
@@ -248,13 +281,14 @@ app.get('/api/folders', async (_req, res) => {
 // to the SSE stream and catch up. Progress is a structured percent, not rsync text.
 const jobs = new Map();
 
-function newJob({ drive, folders, del }) {
+function newJob({ drive, folders, del, direction }) {
     const id = crypto.randomUUID();
     const job = {
         id,
         drive,
         folders,
         del,
+        direction: normalizeDirection(direction),
         status: 'running', // running | done | error | cancelled
         lines: [],
         clients: new Set(),
@@ -283,8 +317,6 @@ function finishJob(job, status) {
     emit(job, 'done', { status });
 }
 
-const BACKUP_LOG = 'backup.log';
-
 function parseBackupLog(text) {
     const byFolder = new Map();
     for (const line of text.split('\n')) {
@@ -311,16 +343,41 @@ async function readBackupLog(destBase) {
     }
 }
 
-async function resolveDestDrive(drive) {
+async function resolveUsbDrive(drive) {
     if (!isSafeSegment(drive)) return { error: 'Invalid drive name', status: 400 };
-    const destBase = path.join(MOUNT_BASE, drive);
-    if (path.resolve(destBase) === path.resolve(SOURCE_BASE)) {
-        return { error: 'Destination cannot be the source', status: 400 };
+    const usbBase = path.join(MOUNT_BASE, drive);
+    if (path.resolve(usbBase) === path.resolve(SOURCE_BASE)) {
+        return { error: 'USB drive cannot be the media source', status: 400 };
     }
-    if (!(await isMountpoint(destBase))) {
-        return { error: `${destBase} is not a mounted drive`, status: 400 };
+    if (!(await isMountpoint(usbBase))) {
+        return { error: `${usbBase} is not a mounted drive`, status: 400 };
     }
-    return { destBase };
+    return { usbBase };
+}
+
+async function resolveCopyBases({ direction, drive }) {
+    const usb = await resolveUsbDrive(drive);
+    if (usb.error) return usb;
+    if (direction === 'from-usb') {
+        return {
+            sourceBase: usb.usbBase,
+            destBase: SOURCE_BASE,
+            usbBase: usb.usbBase,
+            direction,
+        };
+    }
+    return {
+        sourceBase: SOURCE_BASE,
+        destBase: usb.usbBase,
+        usbBase: usb.usbBase,
+        direction: 'to-usb',
+    };
+}
+
+async function resolveDestDrive(drive) {
+    const resolved = await resolveUsbDrive(drive);
+    if (resolved.error) return resolved;
+    return { destBase: resolved.usbBase };
 }
 
 function execErrorMessage(err) {
@@ -426,7 +483,7 @@ app.post('/api/drives/:drive/unmount', async (req, res) => {
     );
     if (busy) {
         return res.status(409).json({
-            error: 'Cannot unmount while a copy to this drive is running',
+            error: 'Cannot unmount while a copy involving this drive is running',
         });
     }
     try {
@@ -489,7 +546,9 @@ async function writeFolderLog(destBase, entry) {
 }
 
 async function runJob(job) {
-    const destBase = path.join(MOUNT_BASE, job.drive);
+    const bases = await resolveCopyBases({ direction: job.direction, drive: job.drive });
+    if (bases.error) throw new Error(bases.error);
+    const { sourceBase, destBase, usbBase } = bases;
     const signal = job.abort.signal;
 
     const scan = {
@@ -513,10 +572,16 @@ async function runJob(job) {
     };
 
     emit(job, 'scan', scan);
-    emit(job, 'line', { type: 'header', text: 'Scanning source and destination…' });
+    emit(job, 'line', {
+        type: 'header',
+        text:
+            job.direction === 'from-usb'
+                ? `Scanning ${usbBase} → ${SOURCE_BASE}…`
+                : `Scanning ${SOURCE_BASE} → ${usbBase}…`,
+    });
 
     const plan = await planJob({
-        sourceBase: SOURCE_BASE,
+        sourceBase,
         destBase,
         folders: job.folders,
         del: job.del,
@@ -598,7 +663,8 @@ async function runJob(job) {
         },
         onFolderDone: async (entry) => {
             try {
-                await writeFolderLog(destBase, entry);
+                // Always log on the USB drive so history stays with the removable media.
+                await writeFolderLog(usbBase, entry);
                 emit(job, 'line', {
                     type: 'out',
                     text: `logged ${entry.folder} → ${BACKUP_LOG}`,
@@ -626,6 +692,7 @@ app.get('/api/copy', (_req, res) => {
             drive: j.drive,
             folders: j.folders,
             del: j.del,
+            direction: j.direction,
             status: j.status,
             createdAt: j.createdAt,
         }));
@@ -634,7 +701,8 @@ app.get('/api/copy', (_req, res) => {
 
 // ── API: start a copy job ─────────────────────────────────────────────────────
 app.post('/api/copy', async (req, res) => {
-    const { drive, folders, del } = req.body || {};
+    const { drive, folders, del, direction: rawDirection } = req.body || {};
+    const direction = normalizeDirection(rawDirection);
 
     if (!isSafeSegment(drive)) {
         return res.status(400).json({ error: 'Invalid drive name' });
@@ -649,21 +717,18 @@ app.post('/api/copy', async (req, res) => {
     // Re-validate against the real filesystem: the drive must be a live mount,
     // and every folder must actually exist in the source. This defends against
     // a client sending names that passed the syntax check but aren't real.
-    const destBase = path.join(MOUNT_BASE, drive);
-    if (path.resolve(destBase) === path.resolve(SOURCE_BASE)) {
-        return res.status(400).json({ error: 'Destination cannot be the source' });
-    }
-    if (!(await isMountpoint(destBase))) {
-        return res.status(400).json({ error: `${destBase} is not a mounted drive` });
+    const bases = await resolveCopyBases({ direction, drive });
+    if (bases.error) {
+        return res.status(bases.status).json({ error: bases.error });
     }
     for (const folder of folders) {
-        const s = await fsp.stat(path.join(SOURCE_BASE, folder)).catch(() => null);
+        const s = await fsp.stat(path.join(bases.sourceBase, folder)).catch(() => null);
         if (!s || !s.isDirectory()) {
             return res.status(400).json({ error: `Source folder not found: ${folder}` });
         }
     }
 
-    const job = newJob({ drive, folders, del: !!del });
+    const job = newJob({ drive, folders, del: !!del, direction });
     res.json({ jobId: job.id });
     // Kick off after responding; clients attach to the SSE stream next.
     runJob(job).catch((err) => {
